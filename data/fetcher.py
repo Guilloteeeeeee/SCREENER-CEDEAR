@@ -223,8 +223,16 @@ def fetch_ticker_data(ticker: str) -> dict:
         # P/B
         result["p_b_actual"] = _safe_float(info.get("priceToBook"), min_val=0, max_val=200)
 
-        # Dividend Yield
-        result["dividend_yield_actual"] = _safe_float(info.get("dividendYield"), min_val=0, max_val=0.5)
+        # Dividendo anual (para Fair Value por DY) — base para validar DY
+        annual_div = _safe_float(info.get("dividendRate"), min_val=0, max_val=100)
+        result["annual_dividend"] = annual_div
+
+        # Dividend Yield — solo válido si la empresa realmente paga dividendo
+        dy_raw = _safe_float(info.get("dividendYield"), min_val=0, max_val=0.5)
+        if dy_raw is not None and dy_raw > 0 and annual_div and annual_div > 0:
+            result["dividend_yield_actual"] = dy_raw
+        else:
+            result["dividend_yield_actual"] = None  # no paga dividendo
 
         # PEG
         result["peg_actual"] = _safe_float(info.get("pegRatio"), min_val=0, max_val=100)
@@ -243,9 +251,6 @@ def fetch_ticker_data(ticker: str) -> dict:
         # P/FFO y P/AFFO para REITs (proxy via P/E)
         result["p_ffo_actual"] = result["per_actual"]
         result["p_affo_actual"] = result["per_actual"]
-
-        # Dividendo anual (para Fair Value por DY)
-        result["annual_dividend"] = _safe_float(info.get("dividendRate"), min_val=0, max_val=100)
 
         # --- Histórico anual para medianas ---
         time.sleep(REQUEST_DELAY)
