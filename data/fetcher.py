@@ -3,11 +3,9 @@ Módulo de descarga de datos desde Yahoo Finance (yfinance).
 Obtiene métricas actuales e históricas para calcular medianas.
 
 Estrategia de obtención de medianas (en orden de prioridad):
-  1. Calcular directamente desde estados financieros históricos (tk.financials, etc.)
-  2. Si falla, usar el valor actual como mediana (ratio = 1.0, score neutro = 50)
-
-Este fallback garantiza que empresas con datos actuales válidos NUNCA queden
-en DATOS INSUFICIENTES por falta de histórico.
+  1. Calcular desde estados financieros históricos de yfinance (tk.financials, etc.)
+  2. Si yfinance no tiene el dato → scrapear Stock Analysis (stockanalysis.com)
+  3. Si tampoco → la métrica queda sin mediana (DATOS INSUFICIENTES solo si < 2 métricas)
 """
 
 import yfinance as yf
@@ -207,91 +205,96 @@ def _enrich_with_history(tk: yf.Ticker, result: dict, info: dict) -> None:
     Agrega medianas históricas al resultado.
 
     Estrategia:
-    1. Intenta calcular medianas desde estados financieros históricos.
-    2. Si falla (pocos datos, yfinance no devuelve histórico), usa el valor actual
-       como mediana — así el scoring arroja ~50 (bien valuada) en lugar de DATOS INSUFICIENTES.
+    1. Intenta calcular medianas desde estados financieros históricos de yfinance.
+    2. Para métricas que siguen sin mediana → intenta Stock Analysis scraping.
+    3. Si tampoco hay → queda None (la métrica no aporta al score).
     """
+    # Precio histórico anual (necesario para algunos cálculos de SA también)
+    precio_hist = {}
     try:
-        income = tk.financials      # income statement anual
-        balance = tk.balance_sheet  # balance sheet anual
-        cashflow = tk.cashflow      # cash flow anual
         hist = tk.history(period=f"{HISTORY_YEARS}y", interval="1mo")
+        if not hist.empty:
+            for year in range(hist.index[-1].year - HISTORY_YEARS + 1, hist.index[-1].year + 1):
+                p = _get_annual_price(hist, year)
+                if p:
+                    precio_hist[year] = p
+    except Exception:
+        hist = pd.DataFrame()
 
-        shares = _safe_float(info.get("sharesOutstanding")) or _safe_float(info.get("impliedSharesOutstanding"))
+    try:
+        income = tk.financials
+        balance = tk.balance_sheet
+        cashflow = tk.cashflow
+        shares = (
+            _safe_float(info.get("sharesOutstanding")) or
+            _safe_float(info.get("impliedSharesOutstanding"))
+        )
 
         # --- EV/EBITDA histórico ---
-        ev_ebitda_list = []
         if not (income is None or income.empty) and shares and not hist.empty:
-            ev_ebitda_list = _calc_ev_ebitda_history(income, balance, hist, shares)
-        if ev_ebitda_list:
-            result["ev_ebitda_mediana"] = round(float(np.median(ev_ebitda_list)), 2)
-        elif result["ev_ebitda_actual"] is not None:
-            result["ev_ebitda_mediana"] = result["ev_ebitda_actual"]  # fallback
+            vals = _calc_ev_ebitda_history(income, balance, hist, shares)
+            if vals:
+                result["ev_ebitda_mediana"] = round(float(np.median(vals)), 2)
 
         # --- PER histórico ---
-        per_list = []
         if not (income is None or income.empty) and not hist.empty:
-            per_list = _calc_per_history(income, balance, hist, shares, info)
-        if per_list:
-            result["per_mediana"] = round(float(np.median(per_list)), 2)
-        elif result["per_actual"] is not None:
-            result["per_mediana"] = result["per_actual"]  # fallback
+            vals = _calc_per_history(income, balance, hist, shares, info)
+            if vals:
+                result["per_mediana"] = round(float(np.median(vals)), 2)
 
         # --- P/FCF histórico ---
-        pfcf_list = []
-        if not (cashflow is None or cashflow.empty) and not (balance is None or balance.empty) and not hist.empty:
-            pfcf_list = _calc_pfcf_history(cashflow, balance, hist, shares, info)
-        if pfcf_list:
-            result["p_fcf_mediana"] = round(float(np.median(pfcf_list)), 2)
-        elif result["p_fcf_actual"] is not None:
-            result["p_fcf_mediana"] = result["p_fcf_actual"]  # fallback
+        if (not (cashflow is None or cashflow.empty) and
+                not (balance is None or balance.empty) and not hist.empty):
+            vals = _calc_pfcf_history(cashflow, balance, hist, shares, info)
+            if vals:
+                result["p_fcf_mediana"] = round(float(np.median(vals)), 2)
 
         # --- P/B histórico ---
-        pb_list = []
         if not (balance is None or balance.empty) and not hist.empty:
-            pb_list = _calc_pb_history(balance, hist, shares, info)
-        if pb_list:
-            result["p_b_mediana"] = round(float(np.median(pb_list)), 2)
-        elif result["p_b_actual"] is not None:
-            result["p_b_mediana"] = result["p_b_actual"]  # fallback
+            vals = _calc_pb_history(balance, hist, shares, info)
+            if vals:
+                result["p_b_mediana"] = round(float(np.median(vals)), 2)
 
         # --- Dividend Yield histórico ---
-        dy_list = []
         if not hist.empty:
-            dy_list = _calc_divy_history(tk, hist)
-        if dy_list:
-            result["dividend_yield_mediana"] = round(float(np.median(dy_list)), 4)
-        elif result["dividend_yield_actual"] is not None:
-            result["dividend_yield_mediana"] = result["dividend_yield_actual"]  # fallback
+            vals = _calc_divy_history(tk, hist)
+            if vals:
+                result["dividend_yield_mediana"] = round(float(np.median(vals)), 4)
 
-        # PEG: usar actual como mediana
+        # PEG y FFO/AFFO: usar actual como mediana (no tienen fuente histórica confiable)
         result["peg_mediana"] = result["peg_actual"]
-
-        # FFO/AFFO: proxy via PER
         result["p_ffo_mediana"] = result["per_mediana"]
         result["p_affo_mediana"] = result["per_mediana"]
 
     except Exception as e:
-        logger.debug(f"Error en histórico para {result['ticker']}: {e}")
-        # Aunque falle todo, aplicar fallback: mediana = actual
-        _apply_fallback_medianas(result)
+        logger.debug(f"Error en histórico yfinance para {result['ticker']}: {e}")
+
+    # --- Fallback 2: Stock Analysis para métricas que siguen sin mediana ---
+    _enrich_with_stockanalysis_fallback(result, precio_hist)
 
 
-def _apply_fallback_medianas(result: dict) -> None:
-    """Si la mediana es None pero el actual existe, usa el actual como mediana."""
-    metric_pairs = [
-        ("ev_ebitda_actual", "ev_ebitda_mediana"),
-        ("per_actual", "per_mediana"),
-        ("p_fcf_actual", "p_fcf_mediana"),
-        ("p_b_actual", "p_b_mediana"),
-        ("dividend_yield_actual", "dividend_yield_mediana"),
-        ("peg_actual", "peg_mediana"),
-        ("p_ffo_actual", "p_ffo_mediana"),
-        ("p_affo_actual", "p_affo_mediana"),
-    ]
-    for actual_key, mediana_key in metric_pairs:
-        if result.get(mediana_key) is None and result.get(actual_key) is not None:
-            result[mediana_key] = result[actual_key]
+def _enrich_with_stockanalysis_fallback(result: dict, precio_hist: dict) -> None:
+    """
+    Intenta completar medianas faltantes usando Stock Analysis.
+    Solo actúa si hay métricas con valor actual pero sin mediana.
+    """
+    # Verificar si hay algo que necesite fallback
+    needs_fallback = (
+        (result.get("per_mediana") is None and result.get("per_actual") is not None) or
+        (result.get("p_b_mediana") is None and result.get("p_b_actual") is not None) or
+        (result.get("p_fcf_mediana") is None and result.get("p_fcf_actual") is not None) or
+        (result.get("dividend_yield_mediana") is None and result.get("dividend_yield_actual") is not None)
+    )
+    if not needs_fallback:
+        return
+
+    try:
+        from data.stockanalysis import enrich_with_stockanalysis
+        enrich_with_stockanalysis(result["ticker"], result, precio_hist)
+    except ImportError:
+        logger.debug("stockanalysis.py no disponible")
+    except Exception as e:
+        logger.debug(f"Error en Stock Analysis fallback para {result['ticker']}: {e}")
 
 
 def _calc_ev_ebitda_history(income, balance, hist, shares: float) -> list:
