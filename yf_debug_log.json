@@ -1,0 +1,21 @@
+{
+  "NVDA": {
+    "ticker": "NVDA",
+    "income": {
+      "status": "empty"
+    },
+    "balance": {
+      "status": "empty"
+    },
+    "cashflow": {
+      "status": "empty"
+    },
+    "medianas_calculadas": {
+      "ev_ebitda_mediana": null,
+      "per_mediana": null,
+      "p_fcf_mediana": null,
+      "p_b_mediana": null,
+      "dividend_yield_mediana": null
+    }
+  }
+}
