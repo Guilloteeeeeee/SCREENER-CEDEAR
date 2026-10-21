@@ -6,7 +6,7 @@ y técnicas descargadas automáticamente desde Yahoo Finance.
 Ejecutar: streamlit run app.py
 """
 
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.9"
 
 import streamlit as st
 import pandas as pd
@@ -203,7 +203,7 @@ def format_metric(val: float | None, decimals: int = 1, suffix: str = "") -> str
 
 def format_market_cap(val: float | None) -> str:
     """Formatea market cap en billones/millones."""
-    if val is None:
+    if val is None or pd.isna(val):
         return "—"
     if val >= 1e12:
         return f"${val/1e12:.1f}T"
@@ -212,6 +212,128 @@ def format_market_cap(val: float | None) -> str:
     if val >= 1e6:
         return f"${val/1e6:.0f}M"
     return f"${val:.0f}"
+
+
+# Países (Yahoo los entrega en inglés) → castellano. Si aparece uno que no está, se muestra tal cual.
+PAISES_ES = {
+    "United States": "Estados Unidos", "United Kingdom": "Reino Unido", "Brazil": "Brasil",
+    "Japan": "Japón", "India": "India", "Ireland": "Irlanda", "Canada": "Canadá",
+    "Spain": "España", "Netherlands": "Países Bajos", "China": "China", "Germany": "Alemania",
+    "Australia": "Australia", "Uruguay": "Uruguay", "Italy": "Italia", "Sweden": "Suecia",
+    "Taiwan": "Taiwán", "France": "Francia", "Norway": "Noruega", "Switzerland": "Suiza",
+    "Denmark": "Dinamarca", "Argentina": "Argentina", "Mexico": "México", "Chile": "Chile",
+    "Colombia": "Colombia", "Peru": "Perú", "Israel": "Israel", "South Korea": "Corea del Sur",
+    "Hong Kong": "Hong Kong", "Singapore": "Singapur", "Belgium": "Bélgica",
+    "Finland": "Finlandia", "Luxembourg": "Luxemburgo", "South Africa": "Sudáfrica",
+    "Bermuda": "Bermudas", "Cayman Islands": "Islas Caimán", "Panama": "Panamá",
+    "Portugal": "Portugal", "Austria": "Austria", "Greece": "Grecia", "Turkey": "Turquía",
+    "Russia": "Rusia", "Jersey": "Jersey", "Guernsey": "Guernsey", "Poland": "Polonia",
+    "New Zealand": "Nueva Zelanda", "Indonesia": "Indonesia", "Malaysia": "Malasia",
+    "Thailand": "Tailandia", "Vietnam": "Vietnam", "Philippines": "Filipinas",
+}
+
+
+def traducir_pais(pais):
+    """Nombre del país en castellano (None/NaN se respetan para que se muestre '—')."""
+    if not isinstance(pais, str) or not pais:
+        return None
+    return PAISES_ES.get(pais, pais)
+
+
+# --- Vista de diagnóstico: métodos del Fair Value (se activa con el casillero de los filtros) ---
+FV_LABELS = {
+    "ev_ebitda": "EV/EBITDA", "per": "PER", "p_fcf": "P/FCF", "p_b": "P/B",
+    "dividend_yield": "DY", "peg": "PEG", "p_ffo": "P/FFO", "p_affo": "P/AFFO",
+}
+
+
+def _num_valido(x) -> bool:
+    return x is not None and not pd.isna(x)
+
+
+def _motivo_metodo_faltante(row, metrica: str) -> str:
+    """Por qué un método del sector no aportó precio al Fair Value."""
+    mediana = row.get(f"{metrica}_mediana")
+    actual = row.get(f"{metrica}_actual")
+    if metrica == "dividend_yield":
+        div = row.get("annual_dividend")
+        if not (_num_valido(div) and div > 0) and not (_num_valido(actual) and actual > 0):
+            return "no paga dividendo"
+    if not _num_valido(mediana) or mediana <= 0:
+        return "sin mediana histórica"
+    if metrica != "dividend_yield" and (not _num_valido(actual) or actual <= 0):
+        return "sin dato actual"
+    return "descartado por fuera de rango"
+
+
+def _metodos_fv_html(row) -> str:
+    """Una línea por método esperado del sector: ✓ con su precio implícito, o ✗ con el motivo."""
+    esperados = SECTOR_CONFIG.get(row.get("sector"), {}).get("metrics", {})
+    if not esperados:
+        return "—"
+    detalle = row.get("fair_value_detalle")
+    detalle = detalle if isinstance(detalle, dict) else {}
+    precio = row.get("precio_actual")
+    lineas = []
+    for metrica, peso in esperados.items():
+        label = FV_LABELS.get(metrica, metrica)
+        d = detalle.get(metrica)
+        if d and _num_valido(d.get("precio")):
+            pm = d["precio"]
+            extra, color = "", "#57606a"
+            if _num_valido(precio) and precio > 0:
+                up = (pm - precio) / precio
+                color = "#2da44e" if up > 0.05 else "#cf222e" if up < -0.05 else "#d4a017"
+                extra = f" ({up * 100:+.0f}%)"
+            lineas.append(
+                f'<span style="color:{color};font-weight:600" title="peso {peso * 100:.0f}%">'
+                f'✓ {label} ${pm:,.2f}{extra}</span>'
+            )
+        else:
+            motivo = _motivo_metodo_faltante(row, metrica)
+            lineas.append(
+                f'<span style="color:#8c959f" title="peso {peso * 100:.0f}%">'
+                f'✗ {label} — <i>{motivo}</i></span>'
+            )
+    n_ok = sum(1 for m in esperados if detalle.get(m) and _num_valido(detalle[m].get("precio")))
+    color_n = "#57606a" if n_ok >= len(esperados) else "#bf8700" if n_ok >= 3 else "#cf222e"
+    cabecera = f'<span style="color:{color_n};font-weight:700">{n_ok}/{len(esperados)} métodos</span>'
+    return (
+        '<div style="font-size:11px;line-height:1.35">' + cabecera + "<br>" + "<br>".join(lineas) + "</div>"
+    )
+
+
+def _resumen_cobertura_fv(df_show: pd.DataFrame) -> str:
+    """Resumen de cuántas empresas pudieron usar cada método (sobre las empresas visibles)."""
+    usados, esperados_n, por_cant = {}, {}, {}
+    for _, r in df_show.iterrows():
+        esperados = list(SECTOR_CONFIG.get(r.get("sector"), {}).get("metrics", {}))
+        det = r.get("fair_value_detalle")
+        det = det if isinstance(det, dict) else {}
+        ok = 0
+        for m in esperados:
+            esperados_n[m] = esperados_n.get(m, 0) + 1
+            if m in det:
+                usados[m] = usados.get(m, 0) + 1
+                ok += 1
+        clave = (ok, len(esperados))
+        por_cant[clave] = por_cant.get(clave, 0) + 1
+    por_metodo = " · ".join(
+        f"<b>{FV_LABELS.get(m, m)}</b> {usados.get(m, 0)}/{n}"
+        for m, n in sorted(esperados_n.items(), key=lambda x: -x[1])
+    )
+    por_empresa = " · ".join(
+        f"{ok}/{tot} métodos: <b>{n}</b>"
+        for (ok, tot), n in sorted(por_cant.items(), key=lambda x: (-x[0][0], x[0][1]))
+    )
+    return (
+        '<div style="font-size:12px;color:#57606a;background:#f6f8fa;border:1px solid #d0d7de;'
+        'border-radius:6px;padding:8px 12px;margin-bottom:6px">'
+        '🔬 <b>Cobertura de métodos del Fair Value</b> (empresas visibles)<br>'
+        f'Por método (empresas que lo pudieron usar / donde aplica): {por_metodo}<br>'
+        f'Por empresa: {por_empresa}'
+        '</div>'
+    )
 
 
 def get_logo_url(ticker: str) -> str:
@@ -265,7 +387,7 @@ def get_logo_url(ticker: str) -> str:
         "IBN": "icicibank.com", "HDB": "hdfcbank.com", "MUFG": "mufg.jp",
         "ING": "ing.com", "NU": "nu.com.br", "IBKR": "interactivebrokers.com",
         "BX": "blackstone.com", "SPGI": "spglobal.com", "SCHW": "schwab.com",
-        "USB": "usbank.com", "BK": "bny.com", "FISV": "fiserv.com",
+        "USB": "usbank.com", "BNY": "bny.com", "FISV": "fiserv.com",
         "C": "citigroup.com", "AIG": "aig.com", "TJX": "tjx.com",
         "ROST": "rossstores.com", "GM": "gm.com", "RACE": "ferrari.com",
         "ORLY": "oreillyauto.com", "FDX": "fedex.com", "MMM": "3m.com",
@@ -290,7 +412,7 @@ def format_fair_value(fv: float | None, precio: float | None) -> tuple[str, str]
     Retorna (texto, color) para el Fair Value.
     Muestra el precio y el upside/downside vs precio actual.
     """
-    if fv is None or precio is None or precio <= 0:
+    if fv is None or precio is None or pd.isna(fv) or pd.isna(precio) or precio <= 0:
         return "—", "#6e7781"
     upside = (fv - precio) / precio
     color = "#2da44e" if upside > 0.05 else "#cf222e" if upside < -0.05 else "#d4a017"
@@ -365,7 +487,7 @@ def render_filtros_inline(universe: dict, df: pd.DataFrame = None) -> dict:
     mktcap_minimo = mktcap_opciones[mktcap_label]
 
     # --- Fila 2: DY + Métricas + Refresh ---
-    col_dy, col_met, col_ref = st.columns([2, 2, 4])
+    col_dy, col_met, col_diag, col_ref = st.columns([2, 2, 2, 2])
 
     with col_dy:
         dy_minimo = st.slider(
@@ -386,6 +508,15 @@ def render_filtros_inline(universe: dict, df: pd.DataFrame = None) -> dict:
             help="Empresas con menos métricas se muestran en gris",
         )
 
+    with col_diag:
+        st.markdown("<br>", unsafe_allow_html=True)
+        ver_metodos_fv = st.checkbox(
+            "🔬 Ver métodos del Fair Value",
+            key="ver_metodos_fv",
+            help="Vista de revisión: agrega una columna con los métodos usados en cada Fair Value "
+                 "(✓ con su precio implícito, ✗ con el motivo por el que no se pudo usar).",
+        )
+
     with col_ref:
         st.markdown("<br>", unsafe_allow_html=True)
         forzar_refresh = st.button(
@@ -404,6 +535,7 @@ def render_filtros_inline(universe: dict, df: pd.DataFrame = None) -> dict:
         "min_metricas": min_metricas,
         "sort_col": st.session_state.get("sort_col", "fv_upside"),
         "sort_asc": st.session_state.get("sort_asc", False),
+        "ver_metodos_fv": ver_metodos_fv,
         "forzar_refresh": forzar_refresh,
     }
 
@@ -490,6 +622,9 @@ def render_main_table(df: pd.DataFrame, filtros: dict):
         return
 
     st.markdown(f"**{len(df_show)} empresas**")
+    ver_metodos = bool(filtros.get("ver_metodos_fv"))
+    if ver_metodos:
+        st.markdown(_resumen_cobertura_fv(df_show), unsafe_allow_html=True)
     st.markdown("---")
 
     # --- Encabezados con sort clickable ---
@@ -506,12 +641,19 @@ def render_main_table(df: pd.DataFrame, filtros: dict):
         "Categoría": "score_total",
     }
     headers = ["Empresa", "País", "Sector", "Mkt Cap", "Precio", "Fair Value", "Div. Yield", "Rango 52s", "Categoría"]
-    header_cols = st.columns([3, 1, 1.5, 1, 1, 1.8, 1.2, 1.8, 2.8])
+    anchos = [3, 1, 1.5, 1, 1, 1.8, 1.2, 1.8, 2.8]
+    if ver_metodos:
+        headers = headers + ["Métodos del Fair Value"]
+        anchos = anchos + [3.6]
+    header_cols = st.columns(anchos)
 
     current_sort = st.session_state.get("sort_col", "fv_upside")
     current_asc = st.session_state.get("sort_asc", False)
 
     for col_ui, h in zip(header_cols, headers):
+        if h not in SORT_MAP:  # columna de revisión: no se ordena
+            col_ui.markdown(f"<div style='padding-top:6px'><b>🔬 {h}</b></div>", unsafe_allow_html=True)
+            continue
         sort_key = SORT_MAP[h]
         if sort_key == current_sort:
             arrow = "↑" if current_asc else "↓"
@@ -530,7 +672,7 @@ def render_main_table(df: pd.DataFrame, filtros: dict):
 
     # --- Filas ---
     for _, row in df_show.iterrows():
-        cols = st.columns([3, 1, 1.5, 1, 1, 1.8, 0.9, 1.8, 2.8])
+        cols = st.columns([3, 1, 1.5, 1, 1, 1.8, 0.9, 1.8, 2.8] + ([3.6] if ver_metodos else []))
 
         ticker = row.get("ticker", "—")
         nombre = row.get("nombre") or ticker
@@ -552,7 +694,8 @@ def render_main_table(df: pd.DataFrame, filtros: dict):
         )
 
         # País
-        cols[1].markdown(row.get("pais") or "—")
+        pais_txt = row.get("pais")
+        cols[1].markdown(pais_txt if isinstance(pais_txt, str) and pais_txt else "—")
 
         # Sector
         cols[2].markdown(row.get("sector", "—"))
@@ -562,7 +705,7 @@ def render_main_table(df: pd.DataFrame, filtros: dict):
 
         # Precio actual
         precio = row.get("precio_actual")
-        cols[4].markdown(f"${format_metric(precio, 2)}" if precio else "—")
+        cols[4].markdown(f"${format_metric(precio, 2)}" if (pd.notna(precio) and precio) else "—")
 
         # Fair Value con color
         fv = row.get("fair_value")
@@ -599,15 +742,29 @@ def render_main_table(df: pd.DataFrame, filtros: dict):
         # Barra 52 semanas
         cols[7].markdown(render_52w_bar(row.get("posicion_52s")), unsafe_allow_html=True)
 
-        # Categoría badge
+        # Categoría badge + cantidad de métricas usadas en el score (ej: 4/4)
+        usadas, total = row.get("metricas_usadas"), row.get("metricas_total")
+        if _num_valido(usadas) and _num_valido(total) and total > 0:
+            color_n = "#57606a" if usadas >= total else "#bf8700" if usadas >= 3 else "#cf222e"
+            metricas_html = (
+                f'<br><span style="font-size:11px;color:{color_n}" '
+                f'title="Métricas del sector que tuvieron dato actual e histórico para calcular el score">'
+                f'📐 {int(usadas)}/{int(total)} métricas</span>'
+            )
+        else:
+            metricas_html = ""
         cols[8].markdown(
             render_categoria_badge(
                 row.get("emoji", "⚫"),
                 row.get("categoria", "—"),
                 row.get("color_hex", "#6e7781"),
-            ),
+            ) + metricas_html,
             unsafe_allow_html=True,
         )
+
+        # Vista de revisión: métodos usados en el Fair Value
+        if ver_metodos:
+            cols[9].markdown(_metodos_fv_html(row), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -754,7 +911,7 @@ def render_detalle(df: pd.DataFrame):
             label = METRIC_LABELS_FV.get(metrica, metrica.upper())
 
             with fv_cols[i]:
-                if precio_actual and precio_m:
+                if pd.notna(precio_actual) and precio_actual and precio_m:
                     upside = (precio_m - precio_actual) / precio_actual
                     up_str = f"+{upside*100:.0f}%" if upside >= 0 else f"{upside*100:.0f}%"
                     color_m = "#2da44e" if upside > 0.05 else "#cf222e" if upside < -0.05 else "#d4a017"
@@ -817,6 +974,11 @@ def main():
             st.error(f"❌ Error al cargar datos y sin caché disponible: {e}")
             df = None
             fuente = "error"
+
+    # Países en castellano (antes de los filtros, así el filtro, el orden y la tabla los usan)
+    if df is not None and not df.empty and "pais" in df.columns:
+        df = df.copy()
+        df["pais"] = df["pais"].map(traducir_pais)
 
     # Filtros inline (encima de la tabla)
     filtros = render_filtros_inline(universe, df)
