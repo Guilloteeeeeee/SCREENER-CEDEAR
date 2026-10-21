@@ -557,6 +557,105 @@ def main():
     # Panel de detalle
     render_detalle(df)
 
+    # Panel de diagnóstico (solo visible si ?debug=1 en la URL)
+    render_debug_panel()
+
+
+def render_debug_panel():
+    """
+    Panel de diagnóstico oculto. Muestra qué devolvió yfinance para cada ticker.
+    Para activarlo: agregar ?debug=1 a la URL de Streamlit.
+    Útil para entender por qué ciertos tickers muestran DATOS INSUFICIENTES.
+    """
+    # Verificar si debug mode está activo (via query param o session state)
+    query_params = st.query_params
+    debug_mode = query_params.get("debug", "0") == "1"
+
+    if not debug_mode:
+        return
+
+    st.divider()
+    st.subheader("🔧 Panel de Diagnóstico — yfinance Debug")
+    st.caption(
+        "Este panel muestra exactamente qué devolvió yfinance para cada ticker. "
+        "Útil para entender por qué algunas empresas no tienen medianas calculadas."
+    )
+
+    debug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yf_debug_log.json")
+
+    if not os.path.exists(debug_path):
+        st.info("Archivo de diagnóstico no encontrado. Actualizá los datos primero.")
+        return
+
+    try:
+        with open(debug_path, "r", encoding="utf-8") as f:
+            debug_log = json.load(f)
+    except Exception as e:
+        st.error(f"Error leyendo diagnóstico: {e}")
+        return
+
+    st.markdown(f"**{len(debug_log)} tickers registrados** en el último fetch.")
+
+    # Filtro por ticker
+    tickers_disponibles = sorted(debug_log.keys())
+    ticker_sel = st.selectbox("Seleccionar ticker para ver diagnóstico:", tickers_disponibles)
+
+    if ticker_sel and ticker_sel in debug_log:
+        entry = debug_log[ticker_sel]
+
+        col1, col2, col3 = st.columns(3)
+        for col_ui, df_name in zip([col1, col2, col3], ["income", "balance", "cashflow"]):
+            info = entry.get(df_name, {})
+            with col_ui:
+                st.markdown(f"**{df_name}**")
+                status = info.get("status", "unknown")
+                if status == "ok":
+                    st.success(f"✅ OK — {info['shape'][0]} filas × {info['shape'][1]} cols")
+                    st.caption("Columnas: " + ", ".join(str(c) for c in info.get("columns", [])))
+                    with st.expander("Ver filas del índice"):
+                        for row in info.get("index", []):
+                            st.text(row)
+                elif status == "empty":
+                    st.warning("⚠️ DataFrame vacío")
+                else:
+                    st.error("❌ None (no devuelto)")
+
+        st.markdown("**Medianas calculadas:**")
+        medianas = entry.get("medianas_calculadas", {})
+        meds_display = []
+        for k, v in medianas.items():
+            metrica = k.replace("_mediana", "").upper()
+            valor = f"{v:.2f}" if v is not None else "❌ None"
+            meds_display.append({"Métrica": metrica, "Mediana": valor})
+        st.dataframe(pd.DataFrame(meds_display), use_container_width=False, hide_index=True)
+
+        # Mostrar JSON completo
+        with st.expander("Ver JSON completo"):
+            st.json(entry)
+
+    # Resumen de problemas detectados
+    st.markdown("---")
+    st.markdown("**Resumen de tickers con problemas:**")
+    problemas = []
+    for tk, entry in debug_log.items():
+        meds = entry.get("medianas_calculadas", {})
+        faltantes = [k.replace("_mediana", "").upper() for k, v in meds.items() if v is None]
+        inc_status = entry.get("income", {}).get("status", "unknown")
+        bal_status = entry.get("balance", {}).get("status", "unknown")
+        cf_status = entry.get("cashflow", {}).get("status", "unknown")
+        if faltantes:
+            problemas.append({
+                "Ticker": tk,
+                "Income": "✅" if inc_status == "ok" else "❌",
+                "Balance": "✅" if bal_status == "ok" else "❌",
+                "Cashflow": "✅" if cf_status == "ok" else "❌",
+                "Medianas faltantes": ", ".join(faltantes),
+            })
+    if problemas:
+        st.dataframe(pd.DataFrame(problemas), use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ No se detectaron problemas en los tickers analizados.")
+
 
 if __name__ == "__main__":
     main()

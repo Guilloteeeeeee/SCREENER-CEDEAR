@@ -14,6 +14,8 @@ import numpy as np
 from typing import Optional
 import logging
 import time
+import json
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,67 @@ HISTORY_YEARS = 5
 
 # Pausa entre requests para no saturar la API
 REQUEST_DELAY = 0.3  # segundos
+
+# Archivo de diagnóstico — se actualiza con cada fetch completo
+# Útil para debuggear qué devuelve yfinance en producción (Streamlit Cloud)
+_DEBUG_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "yf_debug_log.json")
+
+
+def _log_yf_debug(ticker: str, income, balance, cashflow, result: dict) -> None:
+    """
+    Guarda diagnóstico de lo que devolvió yfinance para este ticker.
+    El archivo yf_debug_log.json se acumula con cada fetch (máx. 50 tickers).
+    Para ver el diagnóstico: agregar ?debug=1 a la URL de Streamlit o usar el panel Debug.
+    """
+    try:
+        def _df_info(df, name: str) -> dict:
+            if df is None:
+                return {"status": "None"}
+            if df.empty:
+                return {"status": "empty"}
+            return {
+                "status": "ok",
+                "shape": list(df.shape),
+                "columns": [str(c) for c in df.columns[:6]],
+                "index": list(df.index[:30]),  # primeras 30 filas
+            }
+
+        entry = {
+            "ticker": ticker,
+            "income": _df_info(income, "income"),
+            "balance": _df_info(balance, "balance"),
+            "cashflow": _df_info(cashflow, "cashflow"),
+            "medianas_calculadas": {
+                k: result.get(k)
+                for k in [
+                    "ev_ebitda_mediana", "per_mediana", "p_fcf_mediana",
+                    "p_b_mediana", "dividend_yield_mediana",
+                ]
+            },
+        }
+
+        # Leer log existente
+        log = {}
+        try:
+            if os.path.exists(_DEBUG_LOG_PATH):
+                with open(_DEBUG_LOG_PATH, "r", encoding="utf-8") as f:
+                    log = json.load(f)
+        except Exception:
+            log = {}
+
+        log[ticker] = entry
+
+        # Mantener solo los últimos 50 tickers para no crecer indefinidamente
+        if len(log) > 50:
+            oldest_keys = list(log.keys())[:-50]
+            for k in oldest_keys:
+                del log[k]
+
+        with open(_DEBUG_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2, default=str)
+
+    except Exception as e:
+        logger.debug(f"Error escribiendo debug log para {ticker}: {e}")
 
 
 def _safe_float(val, min_val=None, max_val=None) -> Optional[float]:
@@ -221,6 +284,7 @@ def _enrich_with_history(tk: yf.Ticker, result: dict, info: dict) -> None:
     except Exception:
         hist = pd.DataFrame()
 
+    income = balance = cashflow = None
     try:
         income = tk.financials
         balance = tk.balance_sheet
@@ -268,6 +332,9 @@ def _enrich_with_history(tk: yf.Ticker, result: dict, info: dict) -> None:
 
     except Exception as e:
         logger.debug(f"Error en histórico yfinance para {result['ticker']}: {e}")
+
+    # Guardar diagnóstico (qué devolvió yfinance exactamente)
+    _log_yf_debug(result["ticker"], income, balance, cashflow, result)
 
     # --- Fallback 2: Stock Analysis para métricas que siguen sin mediana ---
     _enrich_with_stockanalysis_fallback(result, precio_hist)
