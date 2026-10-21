@@ -169,6 +169,7 @@ def fetch_ticker_data(ticker: str) -> dict:
         "peg_actual": None,
         "p_ffo_actual": None,
         "p_affo_actual": None,
+        "annual_dividend": None,
         # Medianas históricas
         "ev_ebitda_mediana": None,
         "per_mediana": None,
@@ -242,6 +243,9 @@ def fetch_ticker_data(ticker: str) -> dict:
         # P/FFO y P/AFFO para REITs (proxy via P/E)
         result["p_ffo_actual"] = result["per_actual"]
         result["p_affo_actual"] = result["per_actual"]
+
+        # Dividendo anual (para Fair Value por DY)
+        result["annual_dividend"] = _safe_float(info.get("dividendRate"), min_val=0, max_val=100)
 
         # --- Histórico anual para medianas ---
         time.sleep(REQUEST_DELAY)
@@ -604,6 +608,111 @@ def _calc_divy_history(tk, hist) -> list:
     except Exception as e:
         logger.debug(f"DivY history error: {e}")
     return values
+
+
+def calc_fair_value(result: dict, sector: str) -> dict:
+    """
+    Calcula el Fair Value (precio objetivo) usando múltiples métodos ponderados por sector.
+
+    Retorna un dict con:
+      - fair_value: precio objetivo ponderado en USD (o None si no hay suficientes datos)
+      - fair_value_detalle: dict con precio implícito por método y su peso
+      - fair_value_metodos: cantidad de métodos con precio calculado
+    """
+    from config.sectors import SECTOR_CONFIG
+
+    fv_result = {
+        "fair_value": None,
+        "fair_value_detalle": {},
+        "fair_value_metodos": 0,
+    }
+
+    if sector not in SECTOR_CONFIG:
+        return fv_result
+
+    config = SECTOR_CONFIG[sector]["metrics"]
+    precio_actual = result.get("precio_actual")
+    shares = None  # no disponible en result; usar proxy cuando sea necesario
+
+    precios_metodos = {}
+
+    for metrica, peso in config.items():
+        mediana = result.get(f"{metrica}_mediana")
+        actual = result.get(f"{metrica}_actual")
+
+        if mediana is None or mediana <= 0:
+            continue
+
+        precio_implicito = None
+
+        if metrica == "per":
+            # PER_mediana × EPS_actual
+            # EPS = precio / PER_actual (si PER_actual existe); sino intentamos reconstruir
+            if actual and actual > 0 and precio_actual and precio_actual > 0:
+                eps = precio_actual / actual
+                precio_implicito = mediana * eps
+
+        elif metrica == "ev_ebitda":
+            # Para EV/EBITDA no podemos reconstruir el precio limpiamente sin deuda/caja/shares
+            # Usamos el ratio: precio_implicito = precio_actual * (mediana / actual)
+            if actual and actual > 0 and precio_actual and precio_actual > 0:
+                precio_implicito = precio_actual * (mediana / actual)
+
+        elif metrica == "p_fcf":
+            # P/FCF_mediana × FCF_per_share
+            # FCF/share = precio / P/FCF_actual
+            if actual and actual > 0 and precio_actual and precio_actual > 0:
+                fcf_per_share = precio_actual / actual
+                precio_implicito = mediana * fcf_per_share
+
+        elif metrica == "p_b":
+            # P/B_mediana × Book Value per share
+            # BVPS = precio / P/B_actual
+            if actual and actual > 0 and precio_actual and precio_actual > 0:
+                bvps = precio_actual / actual
+                precio_implicito = mediana * bvps
+
+        elif metrica == "dividend_yield":
+            # precio = dividendo_anual / DY_mediana
+            annual_div = result.get("annual_dividend")
+            if annual_div and annual_div > 0 and mediana > 0:
+                precio_implicito = annual_div / mediana
+            elif actual and actual > 0 and precio_actual and precio_actual > 0:
+                # Fallback: precio_actual × (actual / mediana)
+                precio_implicito = precio_actual * (actual / mediana)
+
+        elif metrica in ("peg",):
+            # PEG: usamos ratio directo como EV/EBITDA
+            if actual and actual > 0 and precio_actual and precio_actual > 0:
+                precio_implicito = precio_actual * (mediana / actual)
+
+        elif metrica in ("p_ffo", "p_affo"):
+            # Similar a P/E para REITs
+            if actual and actual > 0 and precio_actual and precio_actual > 0:
+                ffo_per_share = precio_actual / actual
+                precio_implicito = mediana * ffo_per_share
+
+        # Validar precio implícito (máximo 10x el precio actual para evitar outliers)
+        if precio_implicito and precio_actual and precio_implicito > 0:
+            ratio_check = precio_implicito / precio_actual
+            if 0.05 < ratio_check < 10.0:  # entre 5% y 1000% del precio actual
+                precios_metodos[metrica] = {
+                    "precio": round(precio_implicito, 2),
+                    "peso": peso,
+                }
+
+    if not precios_metodos:
+        return fv_result
+
+    # Promedio ponderado solo con los métodos disponibles
+    peso_total = sum(v["peso"] for v in precios_metodos.values())
+    fv = sum(v["precio"] * v["peso"] for v in precios_metodos.values()) / peso_total
+
+    fv_result["fair_value"] = round(fv, 2)
+    fv_result["fair_value_detalle"] = precios_metodos
+    fv_result["fair_value_metodos"] = len(precios_metodos)
+
+    return fv_result
 
 
 def fetch_all_tickers(tickers: list, progress_callback=None) -> pd.DataFrame:
