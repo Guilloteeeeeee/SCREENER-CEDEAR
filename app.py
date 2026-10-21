@@ -101,21 +101,28 @@ def save_cache(df: pd.DataFrame):
 @st.cache_data(ttl=CACHE_TTL_HORAS * 3600, show_spinner=False)
 def get_scored_data(universe_key: str) -> tuple[pd.DataFrame, str]:
     """
-    Descarga datos y calcula scores. Cachea en sesión de Streamlit.
-    universe_key fuerza recargar cuando cambia el universo.
-    Retorna (df, fuente) donde fuente es "live", "cache_vigente" o "cache_vencido".
+    Carga datos con esta prioridad:
+    1. Cache vigente (< 6hs) → mostrar directo sin llamar a yfinance
+    2. yfinance → descargar frescos y guardar cache
+    3. Cache vencido → mejor que nada
+    Retorna (df, fuente).
     """
     universe = load_custom_tickers()
     all_tickers = [t for tickers in universe.values() for t in tickers]
-
     ticker_to_sector = {
         ticker: sector
         for sector, tickers in universe.items()
         for ticker in tickers
     }
 
-    progress_bar = st.progress(0, text="Descargando datos de Yahoo Finance...")
+    # 1. Cache vigente → usar directo
+    df_cache, ts_cache = load_cache(ignorar_ttl=False)
+    if df_cache is not None and not df_cache.empty:
+        ts_str = ts_cache.strftime("%d/%m %H:%M") if ts_cache else "?"
+        return df_cache, f"cache_vigente|{ts_str}"
 
+    # 2. Intentar yfinance
+    progress_bar = st.progress(0, text="Descargando datos de Yahoo Finance...")
     try:
         def progress_cb(i, total, ticker):
             pct = int((i / total) * 100)
@@ -124,10 +131,9 @@ def get_scored_data(universe_key: str) -> tuple[pd.DataFrame, str]:
         raw_df = fetch_all_tickers(all_tickers, progress_callback=progress_cb)
         progress_bar.progress(100, text="Calculando scores...")
 
-        # Verificar que el fetch trajo datos reales (no todo None)
         datos_ok = raw_df["precio_actual"].notna().sum() > len(all_tickers) * 0.1
         if not datos_ok:
-            raise ValueError("yfinance devolvió menos del 10% de datos — posible bloqueo o timeout")
+            raise ValueError("yfinance devolvió menos del 10% de datos")
 
         scored_df = score_dataframe(raw_df, ticker_to_sector)
         save_cache(scored_df)
@@ -136,11 +142,12 @@ def get_scored_data(universe_key: str) -> tuple[pd.DataFrame, str]:
 
     except Exception as e:
         progress_bar.empty()
-        # Fallback: cache aunque esté vencido
-        df_cache, ts_cache = load_cache(ignorar_ttl=True)
-        if df_cache is not None and not df_cache.empty:
-            return df_cache, f"cache_vencido|{e}|{ts_cache.strftime('%d/%m %H:%M') if ts_cache else '?'}"
-        raise  # Si no hay cache tampoco, propagar el error
+        # 3. Cache vencido como último recurso
+        df_viejo, ts_viejo = load_cache(ignorar_ttl=True)
+        if df_viejo is not None and not df_viejo.empty:
+            ts_str = ts_viejo.strftime("%d/%m %H:%M") if ts_viejo else "?"
+            return df_viejo, f"cache_vencido|{e}|{ts_str}"
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +853,9 @@ def main():
                     f"Motivo: {error_msg}",
                     icon="⚠️",
                 )
+            elif fuente.startswith("cache_vigente"):
+                ts_str = fuente.split("|")[1] if "|" in fuente else "?"
+                st.info(f"📦 Datos del caché ({ts_str}) — se actualizan cada {CACHE_TTL_HORAS}hs")
         except Exception as e:
             st.error(f"❌ Error al cargar datos y sin caché disponible: {e}")
             df = None
