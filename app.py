@@ -11,8 +11,12 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import sys
 import time
 from datetime import datetime
+
+# Asegurar que el directorio raíz esté en el path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Importaciones del proyecto
 from data.fetcher import fetch_all_tickers
@@ -129,9 +133,12 @@ def render_52w_bar(posicion: float | None) -> str:
     Genera una barra HTML del rango 52 semanas.
     posicion: 0.0 (mínimo del año) a 1.0 (máximo del año)
     """
-    if posicion is None:
+    if posicion is None or (isinstance(posicion, float) and (posicion != posicion)):
         return "—"
-    pct = int(posicion * 100)
+    try:
+        pct = int(float(posicion) * 100)
+    except (TypeError, ValueError):
+        return "—"
     if pct <= 30:
         color = "#2da44e"   # verde
     elif pct <= 70:
